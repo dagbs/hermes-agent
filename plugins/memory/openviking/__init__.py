@@ -73,7 +73,10 @@ class _VikingClient:
             self._url(path), headers=self._headers(), timeout=_TIMEOUT, **kwargs
         )
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError(f'Expected dict response from GET {path}, got {type(data).__name__}')
+        return data
 
     def post(self, path: str, payload: dict = None, **kwargs) -> dict:
         resp = self._httpx.post(
@@ -81,7 +84,10 @@ class _VikingClient:
             timeout=_TIMEOUT, **kwargs
         )
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError(f'Expected dict response from GET {path}, got {type(data).__name__}')
+        return data
 
     def health(self) -> bool:
         try:
@@ -275,7 +281,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         # Provide brief info about the knowledge base
         try:
             # Check what's in the knowledge base via a root listing
-            resp = self._client.get("/api/v1/fs/stat?uri=" + urlencode({"uri": "viking://"}))
+            resp = self._client.get("/api/v1/fs/stat?" + urlencode({"uri": "viking://"}))
             result = resp.get("result", {})
             children = result.get("children", 0)
             if children == 0:
@@ -488,13 +494,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         level = args.get("level", "overview")
         # Map our level names to OpenViking GET endpoints with query params
-        if level == "abstract":
-            resp = self._client.get("/api/v1/content/abstract?uri=" + urlencode({"uri": uri}))
-        elif level == "full":
-            resp = self._client.get("/api/v1/content/read?uri=" + urlencode({"uri": uri}))
-        else:  # overview
-            resp = self._client.get("/api/v1/content/read?" + urlencode({"uri": uri, "level": "overview"}))
-
+        params: Dict[str, Any] = {"uri": uri}
+        if level == "full":
+            params["level"] = "full"
+        elif level == "overview":
+            params["level"] = "overview"
+        # abstract endpoint has no level param
+        endpoint = "/api/v1/content/abstract" if level == "abstract" else "/api/v1/content/read"
+        resp = self._client.get(endpoint + "?" + urlencode(params))
         result = resp.get("result", {})
         content = result.get("content", "")
 
@@ -514,11 +521,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         # Map to OpenViking GET /api/v1/fs/* endpoints
         if action == "list":
-            endpoint = "/api/v1/fs/ls?uri=" + urlencode({"uri": path})
+            endpoint = "/api/v1/fs/ls?" + urlencode({"uri": path})
         elif action == "tree":
-            endpoint = "/api/v1/fs/tree?uri=" + urlencode({"uri": path})
+            endpoint = "/api/v1/fs/tree?" + urlencode({"uri": path})
         elif action == "stat":
-            endpoint = "/api/v1/fs/stat?uri=" + urlencode({"uri": path})
+            endpoint = "/api/v1/fs/stat?" + urlencode({"uri": path})
         else:
             return json.dumps({"error": f"Unknown action: {action}"})
 
