@@ -26,6 +26,7 @@ import logging
 import os
 import threading
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 
 from agent.memory_provider import MemoryProvider
 
@@ -274,7 +275,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         # Provide brief info about the knowledge base
         try:
             # Check what's in the knowledge base via a root listing
-            resp = self._client.post("/api/v1/browse", {"action": "stat", "path": "viking://"})
+            resp = self._client.get("/api/v1/fs/stat?uri=" + urlencode({"uri": "viking://"}))
             result = resp.get("result", {})
             children = result.get("children", 0)
             if children == 0:
@@ -486,13 +487,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return json.dumps({"error": "uri is required"})
 
         level = args.get("level", "overview")
-        # Map our level names to OpenViking endpoints
+        # Map our level names to OpenViking GET endpoints with query params
         if level == "abstract":
-            resp = self._client.post("/api/v1/read/abstract", {"uri": uri})
+            resp = self._client.get("/api/v1/content/abstract?uri=" + urlencode({"uri": uri}))
         elif level == "full":
-            resp = self._client.post("/api/v1/read", {"uri": uri, "level": "read"})
+            resp = self._client.get("/api/v1/content/read?uri=" + urlencode({"uri": uri}))
         else:  # overview
-            resp = self._client.post("/api/v1/read", {"uri": uri, "level": "overview"})
+            resp = self._client.get("/api/v1/content/read?" + urlencode({"uri": uri, "level": "overview"}))
 
         result = resp.get("result", {})
         content = result.get("content", "")
@@ -511,10 +512,17 @@ class OpenVikingMemoryProvider(MemoryProvider):
         action = args.get("action", "list")
         path = args.get("path", "viking://")
 
-        resp = self._client.post("/api/v1/browse", {
-            "action": action,
-            "path": path,
-        })
+        # Map to OpenViking GET /api/v1/fs/* endpoints
+        if action == "list":
+            endpoint = "/api/v1/fs/ls?uri=" + urlencode({"uri": path})
+        elif action == "tree":
+            endpoint = "/api/v1/fs/tree?uri=" + urlencode({"uri": path})
+        elif action == "stat":
+            endpoint = "/api/v1/fs/stat?uri=" + urlencode({"uri": path})
+        else:
+            return json.dumps({"error": f"Unknown action: {action}"})
+
+        resp = self._client.get(endpoint)
         result = resp.get("result", {})
 
         # Format for readability
