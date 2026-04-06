@@ -23,6 +23,7 @@ Capabilities:
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -33,6 +34,30 @@ from urllib.parse import urlencode
 from agent.memory_provider import MemoryProvider
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Process-level atexit safety net -- ensures pending sessions are committed
+# even if shutdown_memory_provider is never called (e.g. gateway crash,
+# SIGKILL, or the gateway bug where _async_flush_memories exception prevents
+# shutdown_memory_provider from being called on session expiry).
+# ---------------------------------------------------------------------------
+_last_active_provider = None
+
+
+def _atexit_commit_sessions():
+    """Fire on_session_end for the last active provider on process exit."""
+    global _last_active_provider
+    provider = _last_active_provider
+    if provider is None:
+        return
+    _last_active_provider = None
+    try:
+        provider.on_session_end([])
+    except Exception:
+        pass  # best-effort at shutdown time
+
+
+atexit.register(_atexit_commit_sessions)
 
 _DEFAULT_ENDPOINT = "http://127.0.0.1:1933"
 _TIMEOUT = 30.0
@@ -84,7 +109,7 @@ class _VikingClient:
         resp.raise_for_status()
         data = resp.json()
         if not isinstance(data, dict):
-            raise ValueError(f'Expected dict response from GET {path}, got {type(data).__name__}')
+            raise ValueError(f'Expected dict response, got {type(data).__name__} from {path}')
         return data
 
     def post(self, path: str, payload: dict = None, **kwargs) -> dict:
@@ -95,7 +120,7 @@ class _VikingClient:
         resp.raise_for_status()
         data = resp.json()
         if not isinstance(data, dict):
-            raise ValueError(f'Expected dict response from GET {path}, got {type(data).__name__}')
+            raise ValueError(f'Expected dict response, got {type(data).__name__} from {path}')
         return data
 
     def health(self) -> bool:
@@ -284,6 +309,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
             logger.warning("httpx not installed — OpenViking plugin disabled")
             self._client = None
 
+        # Register this provider as the last active one for atexit safety net
+        global _last_active_provider
+        _last_active_provider = self
+
     def system_prompt_block(self) -> str:
         if not self._client:
             return ""
@@ -336,7 +365,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 result = resp.get("result", {})
                 parts = []
                 for ctx_type in ("memories", "resources"):
-                    items = result.get(ctx_type, [])
+                    items = raw.get(ctx_type, [])
                     for item in items[:3]:
                         uri = item.get("uri", "")
                         abstract = item.get("abstract", "")
@@ -394,12 +423,19 @@ class OpenVikingMemoryProvider(MemoryProvider):
         OpenViking automatically extracts 6 categories of memories:
         profile, preferences, entities, events, cases, and patterns.
         """
-        if not self._client or self._turn_count == 0:
+        if not self._client:
+            logger.debug("OpenViking on_session_end: no client configured")
             return
 
-        # Wait for any pending sync to finish first
+        # Wait for any pending sync to finish first -- do this even if
+        # _turn_count is 0 to ensure the last turn messages are flushed.
         if self._sync_thread and self._sync_thread.is_alive():
+            logger.debug("OpenViking: waiting for pending sync thread (turn_count=%d)", self._turn_count)
             self._sync_thread.join(timeout=10.0)
+
+        if self._turn_count == 0:
+            logger.debug("OpenViking on_session_end: no turns recorded, skipping commit")
+            return
 
         try:
             self._client.post(f"/api/v1/sessions/{self._session_id}/commit")
@@ -456,6 +492,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
         for t in (self._sync_thread, self._prefetch_thread):
             if t and t.is_alive():
                 t.join(timeout=5.0)
+        # Clear atexit reference so atexit doesn't try to commit again
+        global _last_active_provider
+        if _last_active_provider is self:
+            _last_active_provider = None
 
     # -- Tool implementations ------------------------------------------------
 
@@ -474,12 +514,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
             payload["top_k"] = args["limit"]
 
         resp = self._client.post("/api/v1/search/find", payload)
-        result = resp.get("result", {})
+        raw = resp.get("result")
+        if not isinstance(raw, dict):
+            raw = {}
 
         # Format results for the model — keep it concise
         formatted = []
         for ctx_type in ("memories", "resources", "skills"):
-            items = result.get(ctx_type, [])
+            items = raw.get(ctx_type, [])
             for item in items:
                 entry = {
                     "uri": item.get("uri", ""),
@@ -493,7 +535,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         return json.dumps({
             "results": formatted,
-            "total": result.get("total", len(formatted)),
+            "total": raw.get("total", len(formatted)),
         }, ensure_ascii=False)
 
     def _tool_read(self, args: dict) -> str:
@@ -504,15 +546,20 @@ class OpenVikingMemoryProvider(MemoryProvider):
         level = args.get("level", "overview")
         # Map our level names to OpenViking GET endpoints with query params
         params: Dict[str, Any] = {"uri": uri}
-        if level == "full":
-            params["level"] = "full"
-        elif level == "overview":
-            params["level"] = "overview"
-        # abstract endpoint has no level param
-        endpoint = "/api/v1/content/abstract" if level == "abstract" else "/api/v1/content/read"
+        if level in ("full", "overview", "abstract"):
+            params["level"] = level
+        # Use content/read with level param for all levels (abstract/overview/full)
+        endpoint = "/api/v1/content/read"
         resp = self._client.get(endpoint + "?" + urlencode(params))
-        result = resp.get("result", {})
-        content = result.get("content", "")
+        raw = resp.get("result")
+
+        # OpenViking returns result as a string (the content) for content/read
+        if isinstance(raw, str):
+            content = raw
+        elif isinstance(raw, dict):
+            content = raw.get("content", "")
+        else:
+            content = ""
 
         # Truncate very long content to avoid flooding the context
         if len(content) > 8000:
@@ -539,20 +586,21 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return json.dumps({"error": f"Unknown action: {action}"})
 
         resp = self._client.get(endpoint)
-        result = resp.get("result", {})
+        result = resp.get("result", [])
 
         # Format for readability
-        if action == "list" and "entries" in result:
+        if action == "list":
+            # fs/ls returns a list directly, not a dict with "entries"
             entries = []
-            for e in result["entries"][:50]:  # cap at 50 entries
+            for e in (result if isinstance(result, list) else [])[:50]:
                 entries.append({
-                    "name": e.get("name", ""),
+                    "name": e.get("rel_path", e.get("uri", "").split("/")[-1]),
                     "uri": e.get("uri", ""),
-                    "type": "dir" if e.get("is_dir") else "file",
+                    "type": "dir" if e.get("isDir", e.get("is_dir", False)) else "file",
                 })
             return json.dumps({"path": path, "entries": entries}, ensure_ascii=False)
 
-        return json.dumps(result, ensure_ascii=False)
+        return json.dumps({"path": path, "result": result}, ensure_ascii=False)
 
     def _tool_remember(self, args: dict) -> str:
         content = args.get("content", "")
