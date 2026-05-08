@@ -63,6 +63,9 @@ except ImportError:
         REACTION = "m.reaction"
         ROOM_ENCRYPTED = "m.room.encrypted"
         ROOM_NAME = "m.room.name"
+        ROOM_TOPIC = "m.room.topic"
+        ROOM_JOIN_RULES = "m.room.join_rules"
+        ROOM_MEMBER = "m.room.member"
 
     EventType = _EventTypeStub  # type: ignore[misc,assignment]
 
@@ -103,6 +106,7 @@ from gateway.platforms.base import (
     proxy_kwargs_for_aiohttp,
 )
 from gateway.platforms.helpers import ThreadParticipationTracker
+from .sas_verify import patch_olm_machine, handle_sas_event as _handle_sas
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +292,43 @@ class _CryptoStateStore:
         return list(self._joined_rooms)
 
 
+class _HermesDecryptionDispatcher:
+    """Decrypt ROOM_ENCRYPTED events; buffer failures for retry.
+
+    Replaces the default mautrix DecryptionDispatcher + a separate
+    _on_encrypted_event handler.  A single handler eliminates the dedup
+    race where _on_encrypted_event (zero awaits) marks the event_id
+    before the async DecryptionDispatcher can dispatch the decrypted event.
+    """
+
+    event_type = EventType.ROOM_ENCRYPTED
+
+    def __init__(self, client: Any, adapter: "MatrixAdapter"):
+        self.client = client
+        self._adapter = adapter
+
+    def register(self) -> None:
+        self.client.add_event_handler(self.event_type, self.handle)
+
+    async def handle(self, evt: Any) -> None:
+        try:
+            decrypted = await self.client.crypto.decrypt_megolm_event(evt)
+        except Exception:
+            room_id = str(getattr(evt, "room_id", ""))
+            event_id = str(getattr(evt, "event_id", ""))
+            logger.warning(
+                "Matrix: could not decrypt event %s in %s — buffering for retry",
+                event_id, room_id,
+            )
+            self._adapter._pending_megolm.append((room_id, evt, time.time()))
+            if len(self._adapter._pending_megolm) > _MAX_PENDING_EVENTS:
+                self._adapter._pending_megolm = (
+                    self._adapter._pending_megolm[-_MAX_PENDING_EVENTS:]
+                )
+            return
+        self.client.dispatch_event(decrypted, evt.source)
+
+
 class MatrixAdapter(BasePlatformAdapter):
     """Gateway adapter for Matrix (any homeserver)."""
 
@@ -327,6 +368,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._dm_rooms: Dict[str, bool] = {}
         # Set of room IDs we've joined
         self._joined_rooms: Set[str] = set()
+        self._failed_joins: Set[str] = set()
         # Event deduplication (bounded deque keeps newest entries)
         from collections import deque
 
@@ -364,6 +406,7 @@ class MatrixAdapter(BasePlatformAdapter):
             "MATRIX_REACTIONS", "true"
         ).lower() not in ("false", "0", "no")
         self._pending_reactions: dict[tuple[str, str], str] = {}
+        self._sas_sessions: dict = {}
 
         # Proxy support — resolve once at init, reuse for all HTTP traffic.
         self._proxy_url: str | None = resolve_proxy_url(platform_env_var="MATRIX_PROXY")
@@ -392,6 +435,23 @@ class MatrixAdapter(BasePlatformAdapter):
         self._allowed_user_ids: Set[str] = {
             u.strip() for u in allowed_users_raw.split(",") if u.strip()
         }
+
+
+    async def _handle_sas_event(self, olm, decrypted_evt) -> None:
+        if _handle_sas is not None:
+            await _handle_sas(olm, self, decrypted_evt)
+
+    async def _on_verification_room_event(self, event: Any) -> None:
+        """Handle room-level verification events (sent in DMs by Element)."""
+        try:
+            olm = getattr(self._client, 'crypto', None)
+            if olm and hasattr(olm, '_sas_adapter'):
+                await _handle_sas(olm, self, event)
+            else:
+                logger.warning("SAS: room event but no crypto/adapter for %s", getattr(event, 'type', ''))
+        except Exception as exc:
+            logger.warning("SAS: room event handler error: %s", exc)
+
 
     def _is_duplicate_event(self, event_id) -> bool:
         """Return True if this event was already processed. Tracks the ID otherwise."""
@@ -513,6 +573,35 @@ class MatrixAdapter(BasePlatformAdapter):
                 )
                 return False
             return await self._reverify_keys_after_upload(client, local_ed25519)
+
+            # Re-verify: the server may accept the OTKs (HTTP 200) but
+            # silently ignore new device keys when identity keys are
+            # immutable for the existing device.
+            try:
+                resp2 = await client.query_keys({client.mxid: [client.device_id]})
+                dk2 = (getattr(resp2, "device_keys", {}) or {})
+                ud2 = (dk2.get(str(client.mxid)) or {})
+                keys2 = ud2.get(str(client.device_id))
+                if keys2:
+                    server_ed2 = None
+                    for kid, kval in (getattr(keys2, "keys", {}) or {}).items():
+                        if str(kid).startswith("ed25519:"):
+                            server_ed2 = str(kval)
+                            break
+                    if server_ed2 != local_ed25519:
+                        logger.error(
+                            "Matrix: device %s has immutable identity keys on the "
+                            "server that don't match this installation. Generate a "
+                            "new access token with a fresh device: "
+                            "hermes gateway setup --platform matrix",
+                            client.device_id,
+                        )
+                        return False
+            except Exception as exc:
+                logger.error(
+                    "Matrix: failed to re-verify device keys after upload: %s", exc,
+                )
+                return False
 
         return True
 
@@ -764,6 +853,13 @@ class MatrixAdapter(BasePlatformAdapter):
                             )
 
                 client.crypto = olm
+
+                # Replace the auto-registered DecryptionDispatcher with our
+                # single-path handler that buffers failures for retry.
+                from mautrix.client.client import DecryptionDispatcher
+                client.remove_dispatcher(DecryptionDispatcher)
+                _HermesDecryptionDispatcher(client, self).register()
+
                 logger.info(
                     "Matrix: E2EE enabled (store: %s%s)",
                     str(_CRYPTO_DB_PATH),
@@ -788,6 +884,15 @@ class MatrixAdapter(BasePlatformAdapter):
         client.add_event_handler(EventType.ROOM_MESSAGE, self._on_room_message)
         client.add_event_handler(EventType.REACTION, self._on_reaction)
         client.add_event_handler(IntEvt.INVITE, self._on_invite)
+
+        # --- SAS verify handler ---
+        if self._encryption and client.crypto and patch_olm_machine is not None:
+            try:
+                patch_olm_machine(client.crypto, self)
+                logger.info("Matrix: SAS handler installed")
+            except Exception as exc:
+                logger.warning("Matrix: SAS handler failed: %s", exc)
+
 
         # Initial sync to catch up, then start background sync.
         self._startup_ts = time.time()
@@ -944,8 +1049,138 @@ class MatrixAdapter(BasePlatformAdapter):
 
         return SendResult(success=True, message_id=last_event_id)
 
+    # ------------------------------------------------------------------
+    # Optional Room Metadata Caching (Safe & Non-Breaking)
+    # ------------------------------------------------------------------
+
+    _room_metadata_cache: Dict[str, Dict[str, Any]] = {}  # room_id -> metadata
+    _metadata_cache_ttl = 300  # 5-minute cache
+    _metadata_cache_timestamps: Dict[str, float] = {}  # room_id -> timestamp
+    _metadata_cache_lock = None  # Lazy-initialized lock
+
+    async def _get_metadata_lock(self) -> Any:
+        """Lazy initialization of metadata cache lock."""
+        if self._metadata_cache_lock is None:
+            import asyncio as _asyncio
+            self._metadata_cache_lock = _asyncio.Lock()
+        return self._metadata_cache_lock
+
+    async def _safe_get_room_metadata(self, room_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Safely fetch room metadata with comprehensive error handling and caching.
+        Returns None on any failure - never breaks existing functionality.
+        """
+        # Check if we have a valid cached version
+        lock = await self._get_metadata_lock()
+        async with lock:
+            if room_id in self._room_metadata_cache:
+                if (room_id in self._metadata_cache_timestamps and
+                    (time.time() - self._metadata_cache_timestamps[room_id]) < self._metadata_cache_ttl):
+                    return self._room_metadata_cache[room_id]
+
+        try:
+            # Only fetch if we have a client connection
+            if not self._client:
+                return None
+
+            # Initialize metadata with safe defaults
+            metadata: Dict[str, Any] = {
+                "name": room_id,  # Default to room_id as name
+                "topic": "",
+                "members_count": 0,
+                "topic_type": "unknown"
+            }
+
+            # Fetch room name safely
+            try:
+                name_event = await self._client.get_state_event(
+                    RoomID(room_id),
+                    EventType.ROOM_NAME
+                )
+                if name_event and hasattr(name_event, 'name') and name_event.name:
+                    metadata["name"] = name_event.name
+            except Exception as e:
+                logger.info(f"Matrix: Metadata — failed to fetch room name for {room_id}: {str(e)}")
+                pass  # Never break - use defaults
+
+            # Fetch room topic safely
+            try:
+                topic_event = await self._client.get_state_event(
+                    RoomID(room_id),
+                    EventType.ROOM_TOPIC
+                )
+                if topic_event and hasattr(topic_event, 'topic') and topic_event.topic:
+                    metadata["topic"] = topic_event.topic
+            except Exception as e:
+                logger.info(f"Matrix: Metadata — failed to fetch topic for {room_id}: {str(e)}")
+                pass  # Never break - use empty topic
+
+            # Fetch join rules safely
+            try:
+                rules_event = await self._client.get_state_event(
+                    RoomID(room_id),
+                    EventType.ROOM_JOIN_RULES
+                )
+                if hasattr(rules_event, 'join_rule'):
+                    metadata["topic_type"] = "invite" if rules_event.join_rule == "invite" else "open"
+            except Exception as e:
+                logger.info(f"Matrix: Metadata — failed to fetch join rules for {room_id}: {str(e)}")
+                pass  # Never break - use defaults
+
+            # Fetch actual member count safely
+            try:
+                if hasattr(self._client, '_state_store'):
+                    state_store = self._client._state_store
+                    if hasattr(state_store, 'get_state'):
+                        try:
+                            members = await state_store.get_state(room_id, EventType.ROOM_MEMBER)
+                            if members:
+                                metadata["members_count"] = len(members)
+                        except Exception as e:
+                            logger.info(f"Matrix: Metadata — failed to fetch members for {room_id}: {str(e)}")
+                            pass  # Never break
+            except Exception as e:
+                logger.info(f"Matrix: Metadata — failed to access state store for {room_id}: {str(e)}")
+                pass  # Never break
+
+            # Update cache safely
+            async with lock:
+                self._room_metadata_cache[room_id] = metadata
+                self._metadata_cache_timestamps[room_id] = time.time()
+
+            return metadata
+
+        except Exception as e:
+            # Catch ALL exceptions - never break existing functionality
+            logger.info(f"Matrix: Metadata — overall fetch failed for {room_id}: {str(e)}")
+            return None
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        """Return room name and type (dm/group)."""
+        """Return room name and type (dm/group) with optional metadata."""
+
+        # Try to get cached metadata first
+        metadata = await self._safe_get_room_metadata(chat_id)
+
+        # Build the chat info with metadata
+        if metadata:
+            # Use cached metadata if available
+            name = metadata.get("name", chat_id)
+            chat_type = "dm" if await self._is_dm_room(chat_id) else "group"
+
+            # Add additional metadata to the response
+            result = {
+                "name": name,
+                "type": chat_type,
+                "topic": metadata.get("topic", ""),
+                "topic_type": metadata.get("topic_type", "unknown"),
+                "members_count": metadata.get("members_count", 0),
+                "has_metadata": True
+            }
+
+            logger.info(f"Matrix: Metadata — using cached metadata for {chat_id}")
+            return result
+
+        # Fallback to original behavior if no metadata available
         name = chat_id
         chat_type = "dm" if await self._is_dm_room(chat_id) else "group"
 
@@ -965,7 +1200,6 @@ class MatrixAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Optional overrides
     # ------------------------------------------------------------------
-
     async def send_typing(
         self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
     ) -> None:
@@ -1586,12 +1820,18 @@ class MatrixAdapter(BasePlatformAdapter):
             self._threads.mark(thread_id)
 
         display_name = await self._get_display_name(room_id, sender)
+        # Fetch room metadata for session context (safe, non-blocking).
+        metadata = await self._safe_get_room_metadata(room_id)
+        chat_name = metadata.get("name") if metadata else None
+        chat_topic = metadata.get("topic") if metadata else None
         source = self.build_source(
             chat_id=room_id,
+            chat_name=chat_name,
             chat_type=chat_type,
             user_id=sender,
             user_name=display_name,
             thread_id=thread_id,
+            chat_topic=chat_topic,
         )
 
         if thread_id:
@@ -1863,6 +2103,8 @@ class MatrixAdapter(BasePlatformAdapter):
             return False
         if room_id in self._joined_rooms:
             return True
+        if room_id in self._failed_joins:
+            return False
         try:
             await self._client.join_room(RoomID(room_id))
             self._joined_rooms.add(room_id)
@@ -1870,6 +2112,14 @@ class MatrixAdapter(BasePlatformAdapter):
             await self._refresh_dm_cache()
             return True
         except Exception as exc:
+            err_str = str(exc).lower()
+            if "no servers that are in the room have been provided" in err_str or "m.forbidden" in err_str or "not invited" in err_str:
+                self._failed_joins.add(room_id)
+                try:
+                    await self._client.leave_room(RoomID(room_id))
+                    logger.info("Matrix: rejected invite to %s due to permanent join failure", room_id)
+                except Exception:
+                    pass
             logger.warning("Matrix: error joining %s: %s", room_id, exc)
             return False
 
@@ -2285,21 +2535,14 @@ class MatrixAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _is_dm_room(self, room_id: str) -> bool:
-        """Check if a room is a DM."""
-        if self._dm_rooms.get(room_id, False):
-            return True
-        # Fallback: check member count via state store.
-        state_store = (
-            getattr(self._client, "state_store", None) if self._client else None
-        )
-        if state_store:
-            try:
-                members = await state_store.get_members(room_id)
-                if members and len(members) == 2:
-                    return True
-            except Exception:
-                pass
-        return False
+        """Check if a room is a DM via m.direct account data.
+
+        Only the m.direct cache is authoritative.  The old fallback
+        that checked state_store.get_members() count was removed
+        because after a restart the state store may not have all members
+        loaded yet, causing group rooms to be misidentified as DMs.
+        """
+        return self._dm_rooms.get(room_id, False)
 
     async def _refresh_dm_cache(self) -> None:
         """Refresh the DM room cache from m.direct account data."""
